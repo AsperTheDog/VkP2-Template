@@ -1,0 +1,6 @@
+[submodule "vendor/VkP2"]
+	path = vendor/VkP2
+	url = https://github.com/AsperTheDog/VkP2
+[submodule "vendor/imgui"]
+	path = vendor/imgui
+	url = https://github.com/ocornut/imgui

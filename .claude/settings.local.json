@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Write-Output \\(Get-ChildItem 'F:\\\\random\\\\codes\\\\small random projs\\\\Pyke\\\\' | Format-Table | Out-String\\))"
+    ]
+  }
+}

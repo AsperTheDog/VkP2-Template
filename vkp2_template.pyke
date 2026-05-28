@@ -1,0 +1,48 @@
+
+from packages import Threads
+from env import VULKAN_SDK
+from github import "libsdl-org/SDL" as sdl3_src, tag="release-3.2.4"
+from github import "gabime/spdlog" as spdlog, tag="v1.14.1"
+from github import "AsperTheDog/VkP2" as VkP2, tag="main"
+
+project("VkP2Template", version="0.1.0", lang="c++23")
+
+@HeaderOnly("libs/SDL3")
+target SDL3():
+    def configure(self):
+        self.link += ["SDL3-shared"]
+
+@StaticLibrary("libs/ImGui", source_groups=False)
+target ImGui(PUBLIC SDL3, PUBLIC VkP2):
+    def configure(self):
+        self.sources = [
+            "../../vendor/imgui/imgui.cpp",
+            "../../vendor/imgui/imgui_demo.cpp",
+            "../../vendor/imgui/imgui_draw.cpp",
+            "../../vendor/imgui/imgui_tables.cpp",
+            "../../vendor/imgui/imgui_widgets.cpp",
+            "../../vendor/imgui/backends/imgui_impl_sdl3.cpp",
+            "../../vendor/imgui/backends/imgui_impl_vulkan.cpp"
+        ]
+        self.exports.includes = [
+            "../../vendor/imgui/",
+            "../../vendor/imgui/backends/"
+        ]
+        self.exports.definitions = {"IMGUI_IMPL_VULKAN_USE_VOLK": 1}
+
+@Executable("app")
+target VkP2Template(PRIVATE SDL3, PRIVATE ImGui, PRIVATE VkP2, PRIVATE spdlog, PRIVATE Threads):
+    def configure(self):
+        self.sources = ["src/*.cpp", "src/*.hpp"]
+        self.includes = ["src/"]
+
+        if platform == "windows":
+            self.copy_files += [VULKAN_SDK + "/Bin/slang.dll"]
+
+        if compiler == "msvc":
+            self.flags += ["/W4"]
+        else:
+            self.flags += ["-Wall", "-Wextra"]
+
+        if build_type == "debug":
+            self.definitions["DEBUG"] = True

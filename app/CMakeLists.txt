@@ -5,7 +5,7 @@ target_link_libraries(VkP2Template PRIVATE VkP2)
 target_link_libraries(VkP2Template PRIVATE spdlog)
 target_link_libraries(VkP2Template PRIVATE Threads::Threads)
 
-file(GLOB VkP2Template_SOURCES_0 CONFIGURE_DEPENDS
+file(GLOB_RECURSE VkP2Template_SOURCES_0 CONFIGURE_DEPENDS
     "src/*.cpp"
     "src/*.hpp"
 )

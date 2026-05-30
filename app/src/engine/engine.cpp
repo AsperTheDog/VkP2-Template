@@ -49,8 +49,8 @@ void Engine::init()
 	}
 
 	{
-		auto l_DeviceChooser = vkp::device::LeanModern();
-		const std::optional<VkPhysicalDevice> l_ChosenDevice = vkp::device::chooseBestPhysicalDevice(m_Instance, m_Window.getSurface(), &l_DeviceChooser);
+		auto l_DeviceEval = vkp::device::LeanModern();
+		const std::optional<VkPhysicalDevice> l_ChosenDevice = vkp::device::chooseBestPhysicalDevice(m_Instance, m_Window.getSurface(), &l_DeviceEval);
 		if (!l_ChosenDevice)
 		{
 			spdlog::error("No suitable physical device found!");
@@ -59,7 +59,7 @@ void Engine::init()
 
 		m_PhysicalDevice = *l_ChosenDevice;
 		
-		m_Device = vkp::device::buildFromEval(m_PhysicalDevice, &l_DeviceChooser);
+		m_Device = vkp::device::buildFromEval(m_PhysicalDevice, &l_DeviceEval);
 
 		volkLoadDevice(m_Device);
 		volkLoadDeviceTable(&m_DeviceTable, m_Device);

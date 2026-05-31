@@ -5,6 +5,7 @@
 #include "spdlog/spdlog.h"
 #include "vkp2/device.hpp"
 #include "vkp2/instance.hpp"
+#include "vkp2/sync.hpp"
 #include "vkp2/extra/window.hpp"
 
 constexpr bool g_AssertOnError = true;
@@ -36,7 +37,7 @@ void Engine::init()
 
 		volkInitialize();
 
-		vkp::InstanceBuilder l_Builder(VK_API_VERSION_1_3);
+		vkp::InstanceBuilder l_Builder{};
 #ifndef NDEBUG
 		l_Builder.enableValidationLayers(debugCallback);
 #endif
@@ -57,12 +58,29 @@ void Engine::init()
 			return;
 		}
 
-		m_PhysicalDevice = *l_ChosenDevice;
-		
-		m_Device = vkp::device::buildFromEval(m_PhysicalDevice, &l_DeviceEval);
+		m_DeviceData.physicalDevice = l_ChosenDevice.value();
 
-		volkLoadDevice(m_Device);
-		volkLoadDeviceTable(&m_DeviceTable, m_Device);
+		const vkp::device::DeviceReturn l_Return = vkp::device::buildFromEval(m_DeviceData.physicalDevice, &l_DeviceEval);
+		m_DeviceData.device = l_Return.device;
+
+		volkLoadDevice(m_DeviceData.device);
+		volkLoadDeviceTable(&m_DeviceData.deviceTable, m_DeviceData.device);
+
+		m_DeviceData.deviceTable.vkGetDeviceQueue(m_DeviceData.device, l_Return.queues[0].queueFamilyIndex, 0, &m_GraphicsQueue);
+		m_DeviceData.deviceTable.vkGetDeviceQueue(m_DeviceData.device, l_Return.queues[0].queueFamilyIndex, 1, &m_TransferQueue);
+	}
+
+	{
+		m_TimelineSemaphore = vkp::createTimelineSemaphore(m_DeviceData.device);
+	}
+
+	{
+		m_Swapchain = vkp::Swapchain(m_DeviceData, m_Window.getSurface(), 3, m_Window.getSize().toVkExtent2D(), VK_PRESENT_MODE_FIFO_KHR);
+	}
+
+	{
+		m_CommandPools.resize(m_Swapchain.properties.framesInFlight);
+		vkp::cmd::CommandPool::createPools(m_CommandPools, m_DeviceData.device, 0);
 	}
 }
 
@@ -76,7 +94,16 @@ void Engine::run()
 
 void Engine::destroy()
 {
-	vkDestroyDevice(m_Device, nullptr);
+	for (vkp::cmd::CommandPool& l_Pool : m_CommandPools)
+	{
+		l_Pool.destroy(m_DeviceData.device);
+	}
+
+	m_Swapchain.destroy(m_DeviceData);
+
+	vkDestroySemaphore(m_DeviceData.device, m_TimelineSemaphore, nullptr);
+
+	vkDestroyDevice(m_DeviceData.device, nullptr);
 
 	m_Window.destroy(m_Instance);
 	vkp::destroyInstance(m_Instance, m_DebugUtils);

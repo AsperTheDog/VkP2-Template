@@ -14,6 +14,8 @@ public:
 	void destroy();
 
 private:
+	void recreateSwapchain(Window::Size p_Extent);
+
 	Window m_Window;
 
 	VkInstance m_Instance = VK_NULL_HANDLE;
@@ -28,5 +30,6 @@ private:
 	vkp::Swapchain m_Swapchain{};
 
 	std::vector<vkp::cmd::CommandPool> m_CommandPools;
+	std::vector<VkCommandBuffer> m_CommandBuffers;
 };
 

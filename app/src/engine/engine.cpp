@@ -1,14 +1,19 @@
 #include "engine.hpp"
 
+#include <array>
+#include <cstring>
 #include <vulkan/vk_enum_string_helper.h>
 
+#include "vkp2/image.hpp"
 #include "spdlog/spdlog.h"
 #include "vkp2/device.hpp"
 #include "vkp2/instance.hpp"
+#include "vkp2/pipeline.hpp"
+#include "vkp2/shader.hpp"
 #include "vkp2/sync.hpp"
 #include "vkp2/extra/window.hpp"
 
-constexpr bool g_AssertOnError = true;
+constexpr bool g_AssertOnError = false;
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(const VkDebugUtilsMessageSeverityFlagBitsEXT p_MessageSeverity, const VkDebugUtilsMessageTypeFlagsEXT p_MessageType, const VkDebugUtilsMessengerCallbackDataEXT* p_CallbackData, void*)
 {
@@ -34,9 +39,7 @@ void Engine::init()
 {
 	{
 		m_Window.initMaximized("Vulkan App");
-#ifndef NDEBUG
 		spdlog::debug("Initialized window with size: {}x{}", m_Window.getSize().width, m_Window.getSize().height);
-#endif
 		volkInitialize();
 
 #ifndef NDEBUG
@@ -93,8 +96,10 @@ void Engine::init()
 		spdlog::debug("Loaded device: {}", fmt::ptr(m_DeviceData.device));
 #endif
 
-		m_DeviceData.deviceTable.vkGetDeviceQueue(m_DeviceData.device, l_Return.queues[0].queueFamilyIndex, 0, &m_GraphicsQueue);
-		m_DeviceData.deviceTable.vkGetDeviceQueue(m_DeviceData.device, l_Return.queues[0].queueFamilyIndex, 1, &m_TransferQueue);
+		m_DeviceData.allocator = vkp::device::createVmaAllocator(m_Instance, m_DeviceData);
+
+		m_DeviceData->vkGetDeviceQueue(m_DeviceData.device, l_Return.queues[0].queueFamilyIndex, 0, &m_GraphicsQueue);
+		m_DeviceData->vkGetDeviceQueue(m_DeviceData.device, l_Return.queues[0].queueFamilyIndex, 1, &m_TransferQueue);
 
 #ifndef NDEBUG
 		spdlog::debug("Retrieved graphics queue: {} (family index: {})", fmt::ptr(m_GraphicsQueue), l_Return.queues[0].queueFamilyIndex);
@@ -112,6 +117,7 @@ void Engine::init()
 
 	{
 		m_Swapchain = vkp::Swapchain(m_DeviceData, m_Window.getSurface(), 3, m_Window.getSize().toVkExtent2D(), VK_PRESENT_MODE_FIFO_KHR);
+		m_Swapchain.recreate(m_DeviceData, m_Window.getSurface(), m_Window.getSize().toVkExtent2D());
 		m_Window.getOnPixelResize().connect(this, &Engine::recreateSwapchain);
 
 #ifndef NDEBUG
@@ -125,16 +131,80 @@ void Engine::init()
 	}
 
 	{
-		m_CommandPools.resize(m_Swapchain.properties.framesInFlight);
-		vkp::cmd::CommandPool::createPools(m_CommandPools, m_DeviceData.device, 0);
-		m_CommandBuffers.reserve(m_Swapchain.properties.framesInFlight);
-		for (vkp::cmd::CommandPool& l_Pool : m_CommandPools)
-		{
-			m_CommandBuffers.push_back(l_Pool.allocate(m_DeviceData.device, VK_COMMAND_BUFFER_LEVEL_PRIMARY));
-		}
+		ensureFrameSlots(static_cast<uint32_t>(m_Swapchain.images.size()));
 
 #ifndef NDEBUG
-		spdlog::debug("Created {} command pools and allocated {} command buffers", m_CommandPools.size(), m_CommandBuffers.size());
+		spdlog::debug("Created {} command pools / buffers, {} semaphores and timeline for {} swapchain images", m_CommandPools.size(), m_ImageAvailableSemaphores.size(), m_Swapchain.images.size());
+#endif
+	}
+
+	{
+		constexpr VmaAllocationCreateInfo l_AllocInfo{
+			.flags = 0,
+			.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+		};
+
+		m_DepthBuffer = vkp::createDepthBuffer(m_DeviceData, m_Swapchain, l_AllocInfo);
+		m_DepthBufferView = vkp::createImageView(m_DeviceData, m_DepthBuffer.image, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT);
+
+#ifndef NDEBUG
+		spdlog::debug("Created depth buffer image: {} with allocation: {}", fmt::ptr(m_DepthBuffer.image), fmt::ptr(m_DepthBuffer.alloc));
+		spdlog::debug("Depth buffer allocation info: size: {}, memoryType: {}, mappedData: {}", m_DepthBuffer.info.size, m_DepthBuffer.info.memoryType, fmt::ptr(m_DepthBuffer.info.pMappedData));
+		spdlog::debug("Created depth buffer view: {}", fmt::ptr(m_DepthBufferView));
+#endif
+	}
+
+	{
+		vkp::shader::CompileOptions l_Opts;
+		l_Opts.cacheFolder = "cache/spv";
+
+		m_TriangleShader = vkp::shader::compileFromFile<true>("shaders/triangle.slang", "triangle", l_Opts);
+
+		VkShaderModule l_Vert = m_TriangleShader.createModule(m_DeviceData, VK_SHADER_STAGE_VERTEX_BIT);
+		VkShaderModule l_Frag = m_TriangleShader.createModule(m_DeviceData, VK_SHADER_STAGE_FRAGMENT_BIT);
+
+		const VkFormat l_ColorFormats[]{ m_Swapchain.properties.format.format };
+
+		vkp::pipeline::PipelineBuilder l_Builder;
+		l_Builder.useReflection(m_TriangleShader)
+			.setPipelineCacheFolder("cache/pipeline")
+			.setColorFormats(l_ColorFormats)
+			.addShaderStage(l_Vert, VK_SHADER_STAGE_VERTEX_BIT)
+			.addShaderStage(l_Frag, VK_SHADER_STAGE_FRAGMENT_BIT);
+
+		m_TrianglePipeline = l_Builder.buildGraphics(m_DeviceData);
+
+		m_DeviceData->vkDestroyShaderModule(m_DeviceData.device, l_Vert, nullptr);
+		m_DeviceData->vkDestroyShaderModule(m_DeviceData.device, l_Frag, nullptr);
+
+#ifndef NDEBUG
+		spdlog::debug("Built triangle pipeline (layout: {}, descriptor set layouts: {})", fmt::ptr(m_TrianglePipeline.layout), m_TrianglePipeline.descriptorSetLayouts.size());
+#endif
+	}
+
+	{
+		struct Vertex
+		{
+			float position[3];
+			float color[4];
+		};
+
+		constexpr Vertex l_Vertices[]{
+			{.position = { -0.5f, -0.5f, 0.0f }, .color = { 1.0f, 0.0f, 0.0f, 1.0f }},
+			{.position = { 0.5f, -0.5f, 0.0f }, .color = { 0.0f, 1.0f, 0.0f, 1.0f }},
+			{.position = { 0.0f, 0.5f, 0.0f }, .color = { 0.0f, 0.0f, 1.0f, 1.0f }},
+		};
+
+		constexpr VmaAllocationCreateInfo l_AllocInfo{
+			.flags = 0,
+			.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+		};
+
+		m_TriangleVertexBuffer = vkp::createBuffer(m_DeviceData, sizeof(l_Vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, l_AllocInfo);
+		vkp::uploadBuffer(m_DeviceData, m_CommandPools[0].handle, m_GraphicsQueue, m_TriangleVertexBuffer, l_Vertices, sizeof(l_Vertices));
+
+#ifndef NDEBUG
+		spdlog::debug("Created triangle vertex buffer ({} bytes, stride 28, device-local)", sizeof(l_Vertices));
 #endif
 	}
 }
@@ -144,7 +214,141 @@ void Engine::run()
 	while (!m_Window.shouldClose())
 	{
 		m_Window.pollEvents();
+		drawFrame();
 	}
+}
+
+void Engine::ensureFrameSlots(const uint32_t p_Count)
+{
+	while (m_CommandPools.size() < p_Count)
+	{
+		vkp::cmd::CommandPool l_Pool;
+		l_Pool.init(m_DeviceData.device, 0);
+		m_CommandPools.push_back(l_Pool);
+		m_CommandBuffers.push_back(m_CommandPools.back().allocate(m_DeviceData.device, VK_COMMAND_BUFFER_LEVEL_PRIMARY));
+		m_ImageAvailableSemaphores.push_back(vkp::createSemaphore(m_DeviceData.device));
+		m_RenderFinishedSemaphores.push_back(vkp::createSemaphore(m_DeviceData.device));
+		m_SlotTimelineValues.push_back(0);
+	}
+}
+
+void Engine::drawFrame()
+{
+	const uint32_t l_Frames = static_cast<uint32_t>(m_ImageAvailableSemaphores.size());
+	const VkSemaphore l_ImageAvailable = m_ImageAvailableSemaphores[m_CurrentFrame];
+	VkSemaphore l_RenderFinished = m_RenderFinishedSemaphores[m_CurrentFrame];
+	const VkCommandBuffer l_Cb = m_CommandBuffers[m_CurrentFrame];
+
+	if (m_SlotTimelineValues[m_CurrentFrame] != 0)
+	{
+		vkp::cmd::waitTimeline(m_DeviceData, m_TimelineSemaphore, m_SlotTimelineValues[m_CurrentFrame]);
+	}
+
+	uint32_t l_ImageIndex = 0;
+	const VkResult l_AcquireResult = m_DeviceData->vkAcquireNextImageKHR(m_DeviceData.device, m_Swapchain.swapchain, UINT64_MAX, l_ImageAvailable, VK_NULL_HANDLE, &l_ImageIndex);
+	if (l_AcquireResult == VK_ERROR_OUT_OF_DATE_KHR)
+	{
+		return;
+	}
+
+	m_DeviceData->vkResetCommandPool(m_DeviceData.device, m_CommandPools[m_CurrentFrame].handle, 0);
+
+	vkp::cmd::recordingScope(m_DeviceData, l_Cb, true, [&](const VkCommandBuffer p_Cb)
+	{
+#ifndef NDEBUG
+		constexpr float l_LabelColor[4]{ 1.0f, 1.0f, 1.0f, 1.0f };
+		vkp::cmd::debugScope(p_Cb, "triangle", l_LabelColor, [&](const VkCommandBuffer)
+		{
+#endif
+			VkClearValue l_ClearColor{};
+			l_ClearColor.color.float32[0] = 0.15f;
+			l_ClearColor.color.float32[1] = 0.15f;
+			l_ClearColor.color.float32[2] = 0.2f;
+			l_ClearColor.color.float32[3] = 1.0f;
+
+			const vkp::cmd::AttachmentSpec l_Attachments[]{
+				{
+					.view = m_Swapchain.imageViews[l_ImageIndex],
+					.image = m_Swapchain.images[l_ImageIndex],
+					.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+					.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+					.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+					.clearValue = l_ClearColor,
+				},
+			};
+			const vkp::cmd::FrameSpec l_Frame{
+				.colors = l_Attachments,
+				.depth = nullptr,
+				.extent = m_Swapchain.properties.extent,
+			};
+
+			vkp::cmd::frameRenderScope(m_DeviceData, p_Cb, l_Frame, [&](const VkCommandBuffer p_Cb)
+			{
+				m_DeviceData->vkCmdBindPipeline(p_Cb, VK_PIPELINE_BIND_POINT_GRAPHICS, m_TrianglePipeline.pipeline);
+
+				constexpr std::array<float, 4> l_Tint{ 1.0f, 1.0f, 1.0f, 1.0f };
+				vkp::cmd::pushConstants(m_DeviceData, p_Cb, m_TrianglePipeline.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(l_Tint), l_Tint.data());
+
+				constexpr VkDeviceSize l_Offset = 0;
+				m_DeviceData->vkCmdBindVertexBuffers(p_Cb, 0, 1, &m_TriangleVertexBuffer.buffer, &l_Offset);
+				m_DeviceData->vkCmdDraw(p_Cb, 3, 1, 0, 0);
+			});
+#ifndef NDEBUG
+		});
+#endif
+	});
+
+	++m_TimelineValue;
+
+	constexpr VkPipelineStageFlags2 l_WaitStage2 = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+	const VkCommandBuffer l_CommandBuffers[]{ l_Cb };
+	const vkp::cmd::SemaphoreSubmit l_Waits[]{
+		{ .semaphore = l_ImageAvailable, .stageMask = l_WaitStage2, .value = 0 },
+	};
+	const vkp::cmd::SemaphoreSubmit l_Signals[]{
+		{ .semaphore = l_RenderFinished, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .value = 0 },
+		{ .semaphore = m_TimelineSemaphore, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .value = m_TimelineValue },
+	};
+	vkp::cmd::submit2(m_DeviceData, m_GraphicsQueue, l_CommandBuffers, l_Waits, l_Signals, VK_NULL_HANDLE);
+	m_SlotTimelineValues[m_CurrentFrame] = m_TimelineValue;
+
+	const VkPresentInfoKHR l_PresentInfo{
+		.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+		.pNext = nullptr,
+		.waitSemaphoreCount = 1,
+		.pWaitSemaphores = &l_RenderFinished,
+		.swapchainCount = 1,
+		.pSwapchains = &m_Swapchain.swapchain,
+		.pImageIndices = &l_ImageIndex,
+		.pResults = nullptr,
+	};
+	const VkResult l_PresentResult = m_DeviceData->vkQueuePresentKHR(m_GraphicsQueue, &l_PresentInfo);
+	if (l_PresentResult == VK_ERROR_OUT_OF_DATE_KHR || l_PresentResult == VK_SUBOPTIMAL_KHR)
+	{
+		const VkSemaphoreSubmitInfo l_Wait{
+			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+			.pNext = nullptr,
+			.semaphore = l_RenderFinished,
+			.value = 0,
+			.stageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+			.deviceIndex = 0,
+		};
+		const VkSubmitInfo2 l_Consume{
+			.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+			.pNext = nullptr,
+			.flags = 0,
+			.waitSemaphoreInfoCount = 1,
+			.pWaitSemaphoreInfos = &l_Wait,
+			.commandBufferInfoCount = 0,
+			.pCommandBufferInfos = nullptr,
+			.signalSemaphoreInfoCount = 0,
+			.pSignalSemaphoreInfos = nullptr,
+		};
+		m_DeviceData->vkQueueSubmit2(m_GraphicsQueue, 1, &l_Consume, VK_NULL_HANDLE);
+		m_DeviceData->vkQueueWaitIdle(m_GraphicsQueue);
+	}
+
+	m_CurrentFrame = (m_CurrentFrame + 1) % l_Frames;
 }
 
 void Engine::destroy()
@@ -153,7 +357,37 @@ void Engine::destroy()
 #ifndef NDEBUG
 	spdlog::debug("Destroying engine...");
 #endif
-	vkDeviceWaitIdle(m_DeviceData.device);
+	m_DeviceData->vkDeviceWaitIdle(m_DeviceData.device);
+
+	vkp::destroyBuffer(m_DeviceData, m_TriangleVertexBuffer);
+
+	for (const VkSemaphore l_Semaphore : m_RenderFinishedSemaphores)
+	{
+		m_DeviceData->vkDestroySemaphore(m_DeviceData.device, l_Semaphore, nullptr);
+	}
+	for (const VkSemaphore l_Semaphore : m_ImageAvailableSemaphores)
+	{
+		m_DeviceData->vkDestroySemaphore(m_DeviceData.device, l_Semaphore, nullptr);
+	}
+
+	if (m_TrianglePipeline.pipeline)
+	{
+		m_DeviceData->vkDestroyPipeline(m_DeviceData.device, m_TrianglePipeline.pipeline, nullptr);
+	}
+	if (m_TrianglePipeline.layout)
+	{
+		m_DeviceData->vkDestroyPipelineLayout(m_DeviceData.device, m_TrianglePipeline.layout, nullptr);
+	}
+	for (const VkDescriptorSetLayout l_Layout : m_TrianglePipeline.descriptorSetLayouts)
+	{
+		if (l_Layout)
+		{
+			m_DeviceData->vkDestroyDescriptorSetLayout(m_DeviceData.device, l_Layout, nullptr);
+		}
+	}
+
+	m_DeviceData->vkDestroyImageView(m_DeviceData.device, m_DepthBufferView, nullptr);
+	vmaDestroyImage(m_DeviceData.allocator, m_DepthBuffer.image, m_DepthBuffer.alloc);
 
 	for (vkp::cmd::CommandPool& l_Pool : m_CommandPools)
 	{
@@ -162,8 +396,9 @@ void Engine::destroy()
 
 	m_Swapchain.destroy(m_DeviceData);
 
-	vkDestroySemaphore(m_DeviceData.device, m_TimelineSemaphore, nullptr);
+	m_DeviceData->vkDestroySemaphore(m_DeviceData.device, m_TimelineSemaphore, nullptr);
 
+	vmaDestroyAllocator(m_DeviceData.allocator);
 	vkDestroyDevice(m_DeviceData.device, nullptr);
 
 	m_Window.destroy(m_Instance);
@@ -175,7 +410,8 @@ void Engine::destroy()
 void Engine::recreateSwapchain(const Window::Size p_Extent)
 {
 	m_Swapchain.recreate(m_DeviceData, m_Window.getSurface(), p_Extent.toVkExtent2D());
+	ensureFrameSlots(static_cast<uint32_t>(m_Swapchain.images.size()));
 #ifndef NDEBUG
-	spdlog::debug("Recreated swapchain with new extent: {}x{}", p_Extent.width, p_Extent.height);
+	spdlog::debug("Recreated swapchain with new extent: {}x{} ({} images)", p_Extent.width, p_Extent.height, m_Swapchain.images.size());
 #endif
 }

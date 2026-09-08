@@ -10,6 +10,19 @@ file(GLOB_RECURSE VkP2Template_SOURCES_0 CONFIGURE_DEPENDS
     "src/*.hpp"
 )
 target_sources(VkP2Template PRIVATE ${VkP2Template_SOURCES_0})
+
+target_sources(VkP2Template PRIVATE "src/pch/pch.cpp")
+if (CMAKE_VERSION VERSION_GREATER_EQUAL "3.16")
+    target_precompile_headers(VkP2Template PRIVATE "src/pch/pch.hpp")
+endif()
+
+file(GLOB_RECURSE VkP2Template_SHADERS CONFIGURE_DEPENDS
+    "shaders/*.slang"
+    "shaders/*.slangh"
+)
+set_source_files_properties(${VkP2Template_SHADERS} PROPERTIES HEADER_FILE_ONLY TRUE)
+target_sources(VkP2Template PRIVATE ${VkP2Template_SHADERS})
+
 target_include_directories(VkP2Template PRIVATE
     "src/"
 )
@@ -18,6 +31,14 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "$ENV{VULKAN_SDK}/Bin/slang.dll"
             $<TARGET_FILE_DIR:VkP2Template>
+    )
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
+    add_custom_command(TARGET VkP2Template POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
+            "$<TARGET_FILE_DIR:VkP2Template>/shaders"
     )
 endif()
 if(MSVC)

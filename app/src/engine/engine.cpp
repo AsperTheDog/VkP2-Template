@@ -1,8 +1,13 @@
 #include "engine.hpp"
 
 #include <array>
-#include <cstring>
+#include <imgui.h>
+#include <imgui_impl_sdl3.h>
+#include <imgui_impl_vulkan.h>
+#include <imgui_internal.h>
 #include <vulkan/vk_enum_string_helper.h>
+
+#include <glm/glm.hpp>
 
 #include "vkp2/image.hpp"
 #include "spdlog/spdlog.h"
@@ -100,6 +105,7 @@ void Engine::init()
 
 		m_DeviceData->vkGetDeviceQueue(m_DeviceData.device, l_Return.queues[0].queueFamilyIndex, 0, &m_GraphicsQueue);
 		m_DeviceData->vkGetDeviceQueue(m_DeviceData.device, l_Return.queues[0].queueFamilyIndex, 1, &m_TransferQueue);
+		m_QueueFamilyIndex = l_Return.queues[0].queueFamilyIndex;
 
 #ifndef NDEBUG
 		spdlog::debug("Retrieved graphics queue: {} (family index: {})", fmt::ptr(m_GraphicsQueue), l_Return.queues[0].queueFamilyIndex);
@@ -207,6 +213,14 @@ void Engine::init()
 		spdlog::debug("Created triangle vertex buffer ({} bytes, stride 28, device-local)", sizeof(l_Vertices));
 #endif
 	}
+
+	{
+		initImgui();
+		m_Window.getOnEventCaptured().connect([](const SDL_Event* p_Event)
+		{
+			ImGui_ImplSDL3_ProcessEvent(p_Event);
+		});
+	}
 }
 
 void Engine::run()
@@ -214,6 +228,7 @@ void Engine::run()
 	while (!m_Window.shouldClose())
 	{
 		m_Window.pollEvents();
+		imguiDraw();
 		drawFrame();
 	}
 }
@@ -270,12 +285,12 @@ void Engine::drawFrame()
 				{
 					.view = m_Swapchain.imageViews[l_ImageIndex],
 					.image = m_Swapchain.images[l_ImageIndex],
-					.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 					.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
 					.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
 					.clearValue = l_ClearColor,
 				},
 			};
+
 			const vkp::cmd::FrameSpec l_Frame{
 				.colors = l_Attachments,
 				.depth = nullptr,
@@ -286,12 +301,14 @@ void Engine::drawFrame()
 			{
 				m_DeviceData->vkCmdBindPipeline(p_Cb, VK_PIPELINE_BIND_POINT_GRAPHICS, m_TrianglePipeline.pipeline);
 
-				constexpr std::array<float, 4> l_Tint{ 1.0f, 1.0f, 1.0f, 1.0f };
-				vkp::cmd::pushConstants(m_DeviceData, p_Cb, m_TrianglePipeline.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(l_Tint), l_Tint.data());
+				vkp::cmd::pushConstants(m_DeviceData, p_Cb, m_TrianglePipeline.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(m_ImguiTint), &m_ImguiTint);
 
 				constexpr VkDeviceSize l_Offset = 0;
 				m_DeviceData->vkCmdBindVertexBuffers(p_Cb, 0, 1, &m_TriangleVertexBuffer.buffer, &l_Offset);
 				m_DeviceData->vkCmdDraw(p_Cb, 3, 1, 0, 0);
+
+				ImDrawData* l_DrawData = ImGui::GetDrawData();
+				ImGui_ImplVulkan_RenderDrawData(l_DrawData, p_Cb);
 			});
 #ifndef NDEBUG
 		});
@@ -359,6 +376,15 @@ void Engine::destroy()
 #endif
 	m_DeviceData->vkDeviceWaitIdle(m_DeviceData.device);
 
+	ImGui_ImplVulkan_Shutdown();
+	ImGui_ImplSDL3_Shutdown();
+	ImGui::DestroyContext();
+
+	if (m_ImguiDescriptorPool)
+	{
+		m_DeviceData->vkDestroyDescriptorPool(m_DeviceData.device, m_ImguiDescriptorPool, nullptr);
+	}
+
 	vkp::destroyBuffer(m_DeviceData, m_TriangleVertexBuffer);
 
 	for (const VkSemaphore l_Semaphore : m_RenderFinishedSemaphores)
@@ -405,6 +431,69 @@ void Engine::destroy()
 	vkp::destroyInstance(m_Instance, m_DebugUtils);
 
 	volkFinalize();
+}
+
+void Engine::initImgui()
+{
+	IMGUI_CHECKVERSION();
+	ImGui::CreateContext();
+	ImGui::StyleColorsDark();
+
+	const float l_MainScale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+	ImGuiStyle& l_Style = ImGui::GetStyle();
+	l_Style.ScaleAllSizes(l_MainScale);
+	l_Style.FontScaleDpi = l_MainScale;
+
+	VkDescriptorPoolSize l_PoolSizes[] = {
+		{ .type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .descriptorCount = IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE },
+		{ .type = VK_DESCRIPTOR_TYPE_SAMPLER, .descriptorCount = IMGUI_IMPL_VULKAN_MINIMUM_SAMPLER_POOL_SIZE },
+	};
+
+	VkDescriptorPoolCreateInfo l_PoolInfo{ .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+	l_PoolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+	l_PoolInfo.maxSets = 0;
+	for (const VkDescriptorPoolSize& l_PoolSize : l_PoolSizes)
+		l_PoolInfo.maxSets += l_PoolSize.descriptorCount;
+	l_PoolInfo.poolSizeCount = static_cast<uint32_t>(IM_COUNTOF(l_PoolSizes));
+	l_PoolInfo.pPoolSizes = l_PoolSizes;
+	VULKAN_TRY(m_DeviceData->vkCreateDescriptorPool(m_DeviceData.device, &l_PoolInfo, nullptr, &m_ImguiDescriptorPool));
+
+	VkPipelineRenderingCreateInfo l_PipelineRenderingInfo{ .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+	l_PipelineRenderingInfo.pNext = nullptr;
+	l_PipelineRenderingInfo.colorAttachmentCount = 1;
+	l_PipelineRenderingInfo.pColorAttachmentFormats = &m_Swapchain.properties.format.format;
+	l_PipelineRenderingInfo.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+	l_PipelineRenderingInfo.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
+
+	ImGui_ImplSDL3_InitForVulkan(*m_Window);
+	ImGui_ImplVulkan_InitInfo l_InitInfo{};
+	l_InitInfo.Instance = m_Instance;
+	l_InitInfo.PhysicalDevice = m_DeviceData.physicalDevice;
+	l_InitInfo.Device = m_DeviceData.device;
+	l_InitInfo.QueueFamily = m_QueueFamilyIndex;
+	l_InitInfo.Queue = m_GraphicsQueue;
+	l_InitInfo.PipelineCache = VK_NULL_HANDLE;
+	l_InitInfo.DescriptorPool = m_ImguiDescriptorPool;
+	l_InitInfo.MinImageCount = 2;
+	l_InitInfo.ImageCount = m_Swapchain.images.size();
+	l_InitInfo.Allocator = VK_NULL_HANDLE;
+	l_InitInfo.UseDynamicRendering = true;
+	l_InitInfo.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+	l_InitInfo.PipelineInfoMain.PipelineRenderingCreateInfo = l_PipelineRenderingInfo;
+	ImGui_ImplVulkan_Init(&l_InitInfo);
+}
+
+void Engine::imguiDraw()
+{
+	ImGui_ImplVulkan_NewFrame();
+	ImGui_ImplSDL3_NewFrame();
+	ImGui::NewFrame();
+
+	ImGui::Begin("Config");
+	ImGui::SliderFloat3("Tint", &m_ImguiTint.x, 0.0f, 1.0f);
+	ImGui::End();
+
+	ImGui::Render();
 }
 
 void Engine::recreateSwapchain(const Window::Size p_Extent)

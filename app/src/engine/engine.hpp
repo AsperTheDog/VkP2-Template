@@ -1,5 +1,6 @@
 #pragma once
 #include <volk.h>
+#include <glm/glm.hpp>
 
 #include "vkp2/buffer.hpp"
 #include "vkp2/command_buffer.hpp"
@@ -18,6 +19,9 @@ public:
 	void destroy();
 
 private:
+	void initImgui();
+	void imguiDraw();
+
 	void recreateSwapchain(Window::Size p_Extent);
 	void drawFrame();
 	void ensureFrameSlots(uint32_t p_Count);
@@ -32,6 +36,7 @@ private:
 	VkSemaphore m_TimelineSemaphore = VK_NULL_HANDLE;
 	VkQueue m_GraphicsQueue = VK_NULL_HANDLE;
 	VkQueue m_TransferQueue = VK_NULL_HANDLE;
+	uint32_t m_QueueFamilyIndex = 0;
 
 	vkp::Swapchain m_Swapchain{};
 
@@ -50,5 +55,9 @@ private:
 
 	vkp::shader::Shader<true> m_TriangleShader;
 	vkp::pipeline::PipelineData m_TrianglePipeline{};
+
+	VkDescriptorPool m_ImguiDescriptorPool = VK_NULL_HANDLE;
+
+	glm::vec4 m_ImguiTint{1.f, 1.f, 1.f, 1.f};
 };
 

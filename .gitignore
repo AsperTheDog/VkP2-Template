@@ -137,3 +137,4 @@ CMakeUserPresets.json
 build/
 build-*/
 /app/cache
+app/imgui.ini

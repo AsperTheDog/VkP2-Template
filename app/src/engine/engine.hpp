@@ -26,6 +26,14 @@ private:
 	void drawFrame();
 	void ensureFrameSlots(uint32_t p_Count);
 
+	struct FrameResources
+	{
+		VkSemaphore imageAvailableSemaphore = VK_NULL_HANDLE;
+		vkp::cmd::CommandPool commandPool{};
+		VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+		uint64_t timelineValue = 0;
+	};
+
 	Window m_Window;
 
 	VkInstance m_Instance = VK_NULL_HANDLE;
@@ -40,12 +48,7 @@ private:
 
 	vkp::Swapchain m_Swapchain{};
 
-	std::vector<vkp::cmd::CommandPool> m_CommandPools;
-	std::vector<VkCommandBuffer> m_CommandBuffers;
-
-	std::vector<VkSemaphore> m_ImageAvailableSemaphores;
-	std::vector<VkSemaphore> m_RenderFinishedSemaphores;
-	std::vector<uint64_t> m_SlotTimelineValues;
+	std::vector<FrameResources> m_FrameResources{};
 	uint64_t m_TimelineValue = 0;
 	uint32_t m_CurrentFrame = 0;
 

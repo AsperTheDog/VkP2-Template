@@ -137,10 +137,10 @@ void Engine::init()
 	}
 
 	{
-		ensureFrameSlots(static_cast<uint32_t>(m_Swapchain.images.size()));
+		ensureFrameSlots(m_Swapchain.properties.framesInFlight);
 
 #ifndef NDEBUG
-		spdlog::debug("Created {} command pools / buffers, {} semaphores and timeline for {} swapchain images", m_CommandPools.size(), m_ImageAvailableSemaphores.size(), m_Swapchain.images.size());
+		spdlog::debug("Created {} frame resources", m_FrameResources.size());
 #endif
 	}
 
@@ -207,7 +207,7 @@ void Engine::init()
 		};
 
 		m_TriangleVertexBuffer = vkp::createBuffer(m_DeviceData, sizeof(l_Vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, l_AllocInfo);
-		vkp::uploadBuffer(m_DeviceData, m_CommandPools[0].handle, m_GraphicsQueue, m_TriangleVertexBuffer, l_Vertices, sizeof(l_Vertices));
+		vkp::uploadBuffer(m_DeviceData, m_FrameResources[0].commandPool.handle, m_TransferQueue, m_TriangleVertexBuffer, l_Vertices, sizeof(l_Vertices));
 
 #ifndef NDEBUG
 		spdlog::debug("Created triangle vertex buffer ({} bytes, stride 28, device-local)", sizeof(l_Vertices));
@@ -235,40 +235,37 @@ void Engine::run()
 
 void Engine::ensureFrameSlots(const uint32_t p_Count)
 {
-	while (m_CommandPools.size() < p_Count)
+	while (m_FrameResources.size() < p_Count)
 	{
-		vkp::cmd::CommandPool l_Pool;
-		l_Pool.init(m_DeviceData.device, 0);
-		m_CommandPools.push_back(l_Pool);
-		m_CommandBuffers.push_back(m_CommandPools.back().allocate(m_DeviceData.device, VK_COMMAND_BUFFER_LEVEL_PRIMARY));
-		m_ImageAvailableSemaphores.push_back(vkp::createSemaphore(m_DeviceData.device));
-		m_RenderFinishedSemaphores.push_back(vkp::createSemaphore(m_DeviceData.device));
-		m_SlotTimelineValues.push_back(0);
+		FrameResources& l_Frame = m_FrameResources.emplace_back();
+		l_Frame.commandPool.init(m_DeviceData.device, m_QueueFamilyIndex);
+		l_Frame.commandBuffer = l_Frame.commandPool.allocate(m_DeviceData.device, VK_COMMAND_BUFFER_LEVEL_PRIMARY);
+		l_Frame.imageAvailableSemaphore = vkp::createSemaphore(m_DeviceData.device);
+		l_Frame.timelineValue = 0;
 	}
 }
 
 void Engine::drawFrame()
 {
-	const uint32_t l_Frames = static_cast<uint32_t>(m_ImageAvailableSemaphores.size());
-	const VkSemaphore l_ImageAvailable = m_ImageAvailableSemaphores[m_CurrentFrame];
-	VkSemaphore l_RenderFinished = m_RenderFinishedSemaphores[m_CurrentFrame];
-	const VkCommandBuffer l_Cb = m_CommandBuffers[m_CurrentFrame];
+	FrameResources& l_Frame = m_FrameResources[m_CurrentFrame];
 
-	if (m_SlotTimelineValues[m_CurrentFrame] != 0)
+	if (l_Frame.timelineValue != 0)
 	{
-		vkp::cmd::waitTimeline(m_DeviceData, m_TimelineSemaphore, m_SlotTimelineValues[m_CurrentFrame]);
+		vkp::cmd::waitTimeline(m_DeviceData, m_TimelineSemaphore, l_Frame.timelineValue);
 	}
 
 	uint32_t l_ImageIndex = 0;
-	const VkResult l_AcquireResult = m_DeviceData->vkAcquireNextImageKHR(m_DeviceData.device, m_Swapchain.swapchain, UINT64_MAX, l_ImageAvailable, VK_NULL_HANDLE, &l_ImageIndex);
+	const VkResult l_AcquireResult = m_DeviceData->vkAcquireNextImageKHR(m_DeviceData.device, m_Swapchain.swapchain, UINT64_MAX, l_Frame.imageAvailableSemaphore, VK_NULL_HANDLE, &l_ImageIndex);
 	if (l_AcquireResult == VK_ERROR_OUT_OF_DATE_KHR)
 	{
 		return;
 	}
 
-	m_DeviceData->vkResetCommandPool(m_DeviceData.device, m_CommandPools[m_CurrentFrame].handle, 0);
+	const VkSemaphore l_RenderFinished = m_Swapchain.renderFinishedSemaphores[l_ImageIndex];
 
-	vkp::cmd::recordingScope(m_DeviceData, l_Cb, true, [&](const VkCommandBuffer p_Cb)
+	m_DeviceData->vkResetCommandPool(m_DeviceData.device, l_Frame.commandPool.handle, 0);
+
+	vkp::cmd::recordingScope(m_DeviceData, l_Frame.commandBuffer, true, [&](const VkCommandBuffer p_Cb)
 	{
 #ifndef NDEBUG
 		constexpr float l_LabelColor[4]{ 1.0f, 1.0f, 1.0f, 1.0f };
@@ -318,16 +315,16 @@ void Engine::drawFrame()
 	++m_TimelineValue;
 
 	constexpr VkPipelineStageFlags2 l_WaitStage2 = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-	const VkCommandBuffer l_CommandBuffers[]{ l_Cb };
+	const VkCommandBuffer l_CommandBuffers[]{ l_Frame.commandBuffer };
 	const vkp::cmd::SemaphoreSubmit l_Waits[]{
-		{ .semaphore = l_ImageAvailable, .stageMask = l_WaitStage2, .value = 0 },
+		{ .semaphore = l_Frame.imageAvailableSemaphore, .stageMask = l_WaitStage2, .value = 0 },
 	};
 	const vkp::cmd::SemaphoreSubmit l_Signals[]{
 		{ .semaphore = l_RenderFinished, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .value = 0 },
 		{ .semaphore = m_TimelineSemaphore, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .value = m_TimelineValue },
 	};
 	vkp::cmd::submit2(m_DeviceData, m_GraphicsQueue, l_CommandBuffers, l_Waits, l_Signals, VK_NULL_HANDLE);
-	m_SlotTimelineValues[m_CurrentFrame] = m_TimelineValue;
+	l_Frame.timelineValue = m_TimelineValue;
 
 	const VkPresentInfoKHR l_PresentInfo{
 		.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -365,7 +362,7 @@ void Engine::drawFrame()
 		m_DeviceData->vkQueueWaitIdle(m_GraphicsQueue);
 	}
 
-	m_CurrentFrame = (m_CurrentFrame + 1) % l_Frames;
+	m_CurrentFrame = (m_CurrentFrame + 1) % m_Swapchain.properties.framesInFlight;
 }
 
 void Engine::destroy()
@@ -387,13 +384,16 @@ void Engine::destroy()
 
 	vkp::destroyBuffer(m_DeviceData, m_TriangleVertexBuffer);
 
-	for (const VkSemaphore l_Semaphore : m_RenderFinishedSemaphores)
+	for (FrameResources& l_Frame : m_FrameResources)
 	{
-		m_DeviceData->vkDestroySemaphore(m_DeviceData.device, l_Semaphore, nullptr);
-	}
-	for (const VkSemaphore l_Semaphore : m_ImageAvailableSemaphores)
-	{
-		m_DeviceData->vkDestroySemaphore(m_DeviceData.device, l_Semaphore, nullptr);
+		if (l_Frame.imageAvailableSemaphore)
+		{
+			m_DeviceData->vkDestroySemaphore(m_DeviceData.device, l_Frame.imageAvailableSemaphore, nullptr);
+		}
+		if (l_Frame.commandPool.handle)
+		{
+			l_Frame.commandPool.destroy(m_DeviceData.device);
+		}
 	}
 
 	if (m_TrianglePipeline.pipeline)
@@ -414,11 +414,6 @@ void Engine::destroy()
 
 	m_DeviceData->vkDestroyImageView(m_DeviceData.device, m_DepthBufferView, nullptr);
 	vmaDestroyImage(m_DeviceData.allocator, m_DepthBuffer.image, m_DepthBuffer.alloc);
-
-	for (vkp::cmd::CommandPool& l_Pool : m_CommandPools)
-	{
-		l_Pool.destroy(m_DeviceData.device);
-	}
 
 	m_Swapchain.destroy(m_DeviceData);
 

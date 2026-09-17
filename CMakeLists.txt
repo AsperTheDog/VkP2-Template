@@ -15,15 +15,11 @@ FetchContent_Declare(spdlog
     GIT_REPOSITORY https://github.com/gabime/spdlog.git
     GIT_TAG v1.14.1
 )
-FetchContent_Declare(VkP2
-    GIT_REPOSITORY https://github.com/AsperTheDog/VkP2.git
-    GIT_TAG main
-)
 
 FetchContent_MakeAvailable(sdl3_src)
 FetchContent_MakeAvailable(spdlog)
-FetchContent_MakeAvailable(VkP2)
 
+add_subdirectory(vendor/VkP2)
 add_subdirectory(libs/SDL3)
 add_subdirectory(libs/ImGui)
 add_subdirectory(app)

@@ -41,6 +41,11 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
             "$<TARGET_FILE_DIR:VkP2Template>/shaders"
     )
 endif()
+
+set_target_properties(VkP2Template PROPERTIES
+    VS_DEBUGGER_WORKING_DIRECTORY "$(SolutionDir)..\\app"
+)
+
 if(MSVC)
     target_compile_options(VkP2Template PRIVATE
         "/W4"

@@ -1,28 +1,38 @@
 #pragma once
+#include <array>
+#include <cstddef>
+
 #include <volk.h>
 #include <glm/glm.hpp>
 
-#include "vkp2/buffer.hpp"
-#include "vkp2/command_buffer.hpp"
-#include "vkp2/device.hpp"
-#include "vkp2/image.hpp"
-#include "vkp2/pipeline.hpp"
-#include "vkp2/shader.hpp"
-#include "vkp2/swapchain.hpp"
-#include "vkp2/extra/window.hpp"
+#define VKP2_INCLUDE_EXTRA
+#include "vkp2/vkp2.hpp"
+
+inline constexpr VkSurfaceFormatKHR PREFERRED_SURFACE_FORMATS[]{
+	{ .format = VK_FORMAT_B8G8R8A8_SRGB, .colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
+};
 
 class Engine
 {
 public:
+	Engine() : m_FrameArena(m_FrameArenaBuffer.data(), FRAME_ARENA_BYTES) {}
+
 	void init();
 	void run();
 	void destroy();
 
 private:
+	static constexpr uint32_t FRAMES_IN_FLIGHT = 3;
+
+	static constexpr size_t FRAME_ARENA_BYTES = 64 * 1024ULL;
+	alignas(std::max_align_t) std::array<std::byte, FRAME_ARENA_BYTES> m_FrameArenaBuffer{};
+	vkp::dyn::FrameArena m_FrameArena;
+
 	void initImgui();
 	void imguiDraw();
 
 	void recreateSwapchain(Window::Size p_Extent);
+	void ensureDepthResources();
 	void drawFrame();
 	void ensureFrameSlots(uint32_t p_Count);
 
@@ -32,6 +42,10 @@ private:
 		vkp::cmd::CommandPool commandPool{};
 		VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 		uint64_t timelineValue = 0;
+
+		vkp::Image depthBuffer{};
+		VkImageView depthView = VK_NULL_HANDLE;
+		VkExtent2D depthExtent{};
 	};
 
 	Window m_Window;
@@ -53,11 +67,9 @@ private:
 	uint32_t m_CurrentFrame = 0;
 
 	vkp::BufferData m_TriangleVertexBuffer{};
-	vkp::ImageData m_DepthBuffer{};
-	VkImageView m_DepthBufferView = VK_NULL_HANDLE;
 
 	vkp::shader::Shader<true> m_TriangleShader;
-	vkp::pipeline::PipelineData m_TrianglePipeline{};
+	vkp::dyn::PipelineData<> m_TrianglePipeline{};
 
 	VkDescriptorPool m_ImguiDescriptorPool = VK_NULL_HANDLE;
 

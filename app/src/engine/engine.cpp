@@ -1,6 +1,5 @@
 #include "engine.hpp"
 
-#include <array>
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_vulkan.h>
@@ -16,9 +15,12 @@
 #include "vkp2/pipeline.hpp"
 #include "vkp2/shader.hpp"
 #include "vkp2/sync.hpp"
+#include "vkp2/dyn/barrier.hpp"
 #include "vkp2/extra/window.hpp"
 
 constexpr bool g_AssertOnError = false;
+
+constexpr VkPipelineStageFlags2 g_DepthStages = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(const VkDebugUtilsMessageSeverityFlagBitsEXT p_MessageSeverity, const VkDebugUtilsMessageTypeFlagsEXT p_MessageType, const VkDebugUtilsMessengerCallbackDataEXT* p_CallbackData, void*)
 {
@@ -42,6 +44,16 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(const VkDebugUtilsMessageSev
 
 void Engine::init()
 {
+	m_FrameArena.setGrowHandler([](const size_t p_RequestedBytes, const size_t p_ChunkBytes, void*)
+	{
+#ifndef NDEBUG
+		spdlog::warn("Frame arena budget exceeded: took a chunk of {} bytes for a {} byte request", p_ChunkBytes, p_RequestedBytes);
+#else
+		(void)p_RequestedBytes;
+		(void)p_ChunkBytes;
+#endif
+	});
+
 	{
 		m_Window.initMaximized("Vulkan App");
 		spdlog::debug("Initialized window with size: {}x{}", m_Window.getSize().width, m_Window.getSize().height);
@@ -122,8 +134,7 @@ void Engine::init()
 	}
 
 	{
-		m_Swapchain = vkp::Swapchain(m_DeviceData, m_Window.getSurface(), 3, m_Window.getSize().toVkExtent2D(), VK_PRESENT_MODE_FIFO_KHR);
-		m_Swapchain.recreate(m_DeviceData, m_Window.getSurface(), m_Window.getSize().toVkExtent2D());
+		m_Swapchain = vkp::Swapchain(m_DeviceData, m_Window.getSurface(), c_FramesInFlight, m_Window.getSize().toVkExtent2D(), VK_PRESENT_MODE_FIFO_KHR, g_PreferredSurfaceFormats);
 		m_Window.getOnPixelResize().connect(this, &Engine::recreateSwapchain);
 
 #ifndef NDEBUG
@@ -137,26 +148,10 @@ void Engine::init()
 	}
 
 	{
-		ensureFrameSlots(m_Swapchain.properties.framesInFlight);
+		ensureFrameSlots(c_FramesInFlight);
 
 #ifndef NDEBUG
 		spdlog::debug("Created {} frame resources", m_FrameResources.size());
-#endif
-	}
-
-	{
-		constexpr VmaAllocationCreateInfo l_AllocInfo{
-			.flags = 0,
-			.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-		};
-
-		m_DepthBuffer = vkp::createDepthBuffer(m_DeviceData, m_Swapchain, l_AllocInfo);
-		m_DepthBufferView = vkp::createImageView(m_DeviceData, m_DepthBuffer.image, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT);
-
-#ifndef NDEBUG
-		spdlog::debug("Created depth buffer image: {} with allocation: {}", fmt::ptr(m_DepthBuffer.image), fmt::ptr(m_DepthBuffer.alloc));
-		spdlog::debug("Depth buffer allocation info: size: {}, memoryType: {}, mappedData: {}", m_DepthBuffer.info.size, m_DepthBuffer.info.memoryType, fmt::ptr(m_DepthBuffer.info.pMappedData));
-		spdlog::debug("Created depth buffer view: {}", fmt::ptr(m_DepthBufferView));
 #endif
 	}
 
@@ -171,10 +166,12 @@ void Engine::init()
 
 		const VkFormat l_ColorFormats[]{ m_Swapchain.properties.format.format };
 
-		vkp::pipeline::PipelineBuilder l_Builder;
+		vkp::dyn::PipelineBuilder<> l_Builder;
 		l_Builder.useReflection(m_TriangleShader)
 			.setPipelineCacheFolder("cache/pipeline")
 			.setColorFormats(l_ColorFormats)
+			.setDepthFormat(VK_FORMAT_D32_SFLOAT)
+			.setDepthTest(true, true)
 			.addShaderStage(l_Vert, VK_SHADER_STAGE_VERTEX_BIT)
 			.addShaderStage(l_Frag, VK_SHADER_STAGE_FRAGMENT_BIT);
 
@@ -221,6 +218,12 @@ void Engine::init()
 			ImGui_ImplSDL3_ProcessEvent(p_Event);
 		});
 	}
+
+#ifndef NDEBUG
+	spdlog::debug("Initialization complete, entering main loop");
+#endif
+
+	m_FrameArena.reset();
 }
 
 void Engine::run()
@@ -245,187 +248,81 @@ void Engine::ensureFrameSlots(const uint32_t p_Count)
 	}
 }
 
-void Engine::drawFrame()
+void Engine::ensureDepthResources()
 {
-	FrameResources& l_Frame = m_FrameResources[m_CurrentFrame];
-
-	if (l_Frame.timelineValue != 0)
-	{
-		vkp::cmd::waitTimeline(m_DeviceData, m_TimelineSemaphore, l_Frame.timelineValue);
-	}
-
-	uint32_t l_ImageIndex = 0;
-	const VkResult l_AcquireResult = m_DeviceData->vkAcquireNextImageKHR(m_DeviceData.device, m_Swapchain.swapchain, UINT64_MAX, l_Frame.imageAvailableSemaphore, VK_NULL_HANDLE, &l_ImageIndex);
-	if (l_AcquireResult == VK_ERROR_OUT_OF_DATE_KHR)
-	{
-		return;
-	}
-
-	const VkSemaphore l_RenderFinished = m_Swapchain.renderFinishedSemaphores[l_ImageIndex];
-
-	m_DeviceData->vkResetCommandPool(m_DeviceData.device, l_Frame.commandPool.handle, 0);
-
-	vkp::cmd::recordingScope(m_DeviceData, l_Frame.commandBuffer, true, [&](const VkCommandBuffer p_Cb)
-	{
-#ifndef NDEBUG
-		constexpr float l_LabelColor[4]{ 1.0f, 1.0f, 1.0f, 1.0f };
-		vkp::cmd::debugScope(p_Cb, "triangle", l_LabelColor, [&](const VkCommandBuffer)
-		{
-#endif
-			VkClearValue l_ClearColor{};
-			l_ClearColor.color.float32[0] = 0.15f;
-			l_ClearColor.color.float32[1] = 0.15f;
-			l_ClearColor.color.float32[2] = 0.2f;
-			l_ClearColor.color.float32[3] = 1.0f;
-
-			const vkp::cmd::AttachmentSpec l_Attachments[]{
-				{
-					.view = m_Swapchain.imageViews[l_ImageIndex],
-					.image = m_Swapchain.images[l_ImageIndex],
-					.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-					.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-					.clearValue = l_ClearColor,
-				},
-			};
-
-			const vkp::cmd::FrameSpec l_Frame{
-				.colors = l_Attachments,
-				.depth = nullptr,
-				.extent = m_Swapchain.properties.extent,
-			};
-
-			vkp::cmd::frameRenderScope(m_DeviceData, p_Cb, l_Frame, [&](const VkCommandBuffer p_Cb)
-			{
-				m_DeviceData->vkCmdBindPipeline(p_Cb, VK_PIPELINE_BIND_POINT_GRAPHICS, m_TrianglePipeline.pipeline);
-
-				vkp::cmd::pushConstants(m_DeviceData, p_Cb, m_TrianglePipeline.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(m_ImguiTint), &m_ImguiTint);
-
-				constexpr VkDeviceSize l_Offset = 0;
-				m_DeviceData->vkCmdBindVertexBuffers(p_Cb, 0, 1, &m_TriangleVertexBuffer.buffer, &l_Offset);
-				m_DeviceData->vkCmdDraw(p_Cb, 3, 1, 0, 0);
-
-				ImDrawData* l_DrawData = ImGui::GetDrawData();
-				ImGui_ImplVulkan_RenderDrawData(l_DrawData, p_Cb);
-			});
-#ifndef NDEBUG
-		});
-#endif
-	});
-
-	++m_TimelineValue;
-
-	constexpr VkPipelineStageFlags2 l_WaitStage2 = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-	const VkCommandBuffer l_CommandBuffers[]{ l_Frame.commandBuffer };
-	const vkp::cmd::SemaphoreSubmit l_Waits[]{
-		{ .semaphore = l_Frame.imageAvailableSemaphore, .stageMask = l_WaitStage2, .value = 0 },
+	constexpr VmaAllocationCreateInfo l_AllocInfo{
+		.flags = 0,
+		.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
 	};
-	const vkp::cmd::SemaphoreSubmit l_Signals[]{
-		{ .semaphore = l_RenderFinished, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .value = 0 },
-		{ .semaphore = m_TimelineSemaphore, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .value = m_TimelineValue },
-	};
-	vkp::cmd::submit2(m_DeviceData, m_GraphicsQueue, l_CommandBuffers, l_Waits, l_Signals, VK_NULL_HANDLE);
-	l_Frame.timelineValue = m_TimelineValue;
 
-	const VkPresentInfoKHR l_PresentInfo{
-		.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-		.pNext = nullptr,
-		.waitSemaphoreCount = 1,
-		.pWaitSemaphores = &l_RenderFinished,
-		.swapchainCount = 1,
-		.pSwapchains = &m_Swapchain.swapchain,
-		.pImageIndices = &l_ImageIndex,
-		.pResults = nullptr,
-	};
-	const VkResult l_PresentResult = m_DeviceData->vkQueuePresentKHR(m_GraphicsQueue, &l_PresentInfo);
-	if (l_PresentResult == VK_ERROR_OUT_OF_DATE_KHR || l_PresentResult == VK_SUBOPTIMAL_KHR)
-	{
-		const VkSemaphoreSubmitInfo l_Wait{
-			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-			.pNext = nullptr,
-			.semaphore = l_RenderFinished,
-			.value = 0,
-			.stageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
-			.deviceIndex = 0,
-		};
-		const VkSubmitInfo2 l_Consume{
-			.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-			.pNext = nullptr,
-			.flags = 0,
-			.waitSemaphoreInfoCount = 1,
-			.pWaitSemaphoreInfos = &l_Wait,
-			.commandBufferInfoCount = 0,
-			.pCommandBufferInfos = nullptr,
-			.signalSemaphoreInfoCount = 0,
-			.pSignalSemaphoreInfos = nullptr,
-		};
-		m_DeviceData->vkQueueSubmit2(m_GraphicsQueue, 1, &l_Consume, VK_NULL_HANDLE);
-		m_DeviceData->vkQueueWaitIdle(m_GraphicsQueue);
-	}
+	const VkExtent2D l_Extent = m_Swapchain.properties.extent;
+	uint32_t l_Created = 0;
 
-	m_CurrentFrame = (m_CurrentFrame + 1) % m_Swapchain.properties.framesInFlight;
-}
-
-void Engine::destroy()
-{
-
-#ifndef NDEBUG
-	spdlog::debug("Destroying engine...");
-#endif
-	m_DeviceData->vkDeviceWaitIdle(m_DeviceData.device);
-
-	ImGui_ImplVulkan_Shutdown();
-	ImGui_ImplSDL3_Shutdown();
-	ImGui::DestroyContext();
-
-	if (m_ImguiDescriptorPool)
-	{
-		m_DeviceData->vkDestroyDescriptorPool(m_DeviceData.device, m_ImguiDescriptorPool, nullptr);
-	}
-
-	vkp::destroyBuffer(m_DeviceData, m_TriangleVertexBuffer);
+	auto l_Transitions = vkp::dyn::makeBarrierBuilder(m_FrameArena.allocator<void>());
 
 	for (FrameResources& l_Frame : m_FrameResources)
 	{
-		if (l_Frame.imageAvailableSemaphore)
+		if (l_Frame.depthView != VK_NULL_HANDLE && l_Frame.depthExtent.width == l_Extent.width && l_Frame.depthExtent.height == l_Extent.height)
 		{
-			m_DeviceData->vkDestroySemaphore(m_DeviceData.device, l_Frame.imageAvailableSemaphore, nullptr);
+			continue;
 		}
-		if (l_Frame.commandPool.handle)
+
+		if (l_Frame.depthView != VK_NULL_HANDLE)
 		{
-			l_Frame.commandPool.destroy(m_DeviceData.device);
+			m_DeviceData->vkDestroyImageView(m_DeviceData.device, l_Frame.depthView, nullptr);
+			l_Frame.depthView = VK_NULL_HANDLE;
 		}
+		vkp::destroyImage(m_DeviceData, l_Frame.depthBuffer);
+
+		l_Frame.depthBuffer = vkp::createDepthBuffer(m_DeviceData, l_Extent, l_AllocInfo);
+		l_Frame.depthView = vkp::createImageView(m_DeviceData, l_Frame.depthBuffer);
+		l_Frame.depthExtent = l_Extent;
+		++l_Created;
+
+		l_Transitions.image(l_Frame.depthBuffer, {
+			.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+			.srcStage = VK_PIPELINE_STAGE_2_NONE,	.srcAccess = VK_ACCESS_2_NONE,
+			.dstStage = g_DepthStages,				.dstAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+		});
 	}
 
-	if (m_TrianglePipeline.pipeline)
+	if (l_Created > 0)
 	{
-		m_DeviceData->vkDestroyPipeline(m_DeviceData.device, m_TrianglePipeline.pipeline, nullptr);
+		vkp::cmd::immediateSubmitScope(m_DeviceData, m_DeviceData.device, m_FrameResources.front().commandPool.handle, m_GraphicsQueue, [&](const VkCommandBuffer p_Cb)
+			{
+#ifndef NDEBUG
+				spdlog::debug("Transitioning {} depth buffers in one barrier call", l_Created);
+#endif
+				l_Transitions.record(m_DeviceData, p_Cb);
+			});
 	}
-	if (m_TrianglePipeline.layout)
+
+#ifndef NDEBUG
+	if (l_Created == 0)
 	{
-		m_DeviceData->vkDestroyPipelineLayout(m_DeviceData.device, m_TrianglePipeline.layout, nullptr);
+		spdlog::debug("Kept {} depth buffers at {}x{}", m_FrameResources.size(), l_Extent.width, l_Extent.height);
 	}
-	for (const VkDescriptorSetLayout l_Layout : m_TrianglePipeline.descriptorSetLayouts)
+	else
 	{
-		if (l_Layout)
+		spdlog::debug("Created {} depth buffers of {}x{} ({} kept)", l_Created, l_Extent.width, l_Extent.height, m_FrameResources.size() - l_Created);
+		spdlog::debug("Transitions for those came out of the frame arena: {} of {} bytes used, high water {}", m_FrameArena.used(), m_FrameArena.budget(), m_FrameArena.highWater());
+		for (const FrameResources& l_Frame : m_FrameResources)
 		{
-			m_DeviceData->vkDestroyDescriptorSetLayout(m_DeviceData.device, l_Layout, nullptr);
+			spdlog::debug("Depth buffer image: {}, view: {}, size: {}, memoryType: {}", fmt::ptr(l_Frame.depthBuffer.data.image), fmt::ptr(l_Frame.depthView), l_Frame.depthBuffer.data.info.size, l_Frame.depthBuffer.data.info.memoryType);
 		}
 	}
+#endif
+}
 
-	m_DeviceData->vkDestroyImageView(m_DeviceData.device, m_DepthBufferView, nullptr);
-	vmaDestroyImage(m_DeviceData.allocator, m_DepthBuffer.image, m_DepthBuffer.alloc);
-
-	m_Swapchain.destroy(m_DeviceData);
-
-	m_DeviceData->vkDestroySemaphore(m_DeviceData.device, m_TimelineSemaphore, nullptr);
-
-	vmaDestroyAllocator(m_DeviceData.allocator);
-	vkDestroyDevice(m_DeviceData.device, nullptr);
-
-	m_Window.destroy(m_Instance);
-	vkp::destroyInstance(m_Instance, m_DebugUtils);
-
-	volkFinalize();
+void Engine::recreateSwapchain(const Window::Size p_Extent)
+{
+	m_DeviceData->vkQueueWaitIdle(m_GraphicsQueue);
+	m_Swapchain.recreate(m_DeviceData, m_Window.getSurface(), p_Extent.toVkExtent2D());
+	ensureFrameSlots(c_FramesInFlight);
+	ensureDepthResources();
+#ifndef NDEBUG
+	spdlog::debug("Recreated swapchain with new extent: {}x{} ({} images)", p_Extent.width, p_Extent.height, m_Swapchain.images.size());
+#endif
 }
 
 void Engine::initImgui()
@@ -470,7 +367,7 @@ void Engine::initImgui()
 	l_InitInfo.PipelineCache = VK_NULL_HANDLE;
 	l_InitInfo.DescriptorPool = m_ImguiDescriptorPool;
 	l_InitInfo.MinImageCount = 2;
-	l_InitInfo.ImageCount = m_Swapchain.images.size();
+	l_InitInfo.ImageCount = m_Swapchain.properties.framesInFlight + 1;
 	l_InitInfo.Allocator = VK_NULL_HANDLE;
 	l_InitInfo.UseDynamicRendering = true;
 	l_InitInfo.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
@@ -491,11 +388,164 @@ void Engine::imguiDraw()
 	ImGui::Render();
 }
 
-void Engine::recreateSwapchain(const Window::Size p_Extent)
+void Engine::drawFrame()
 {
-	m_Swapchain.recreate(m_DeviceData, m_Window.getSurface(), p_Extent.toVkExtent2D());
-	ensureFrameSlots(static_cast<uint32_t>(m_Swapchain.images.size()));
+	FrameResources& l_Frame = m_FrameResources[m_CurrentFrame];
+
+	if (l_Frame.timelineValue != 0)
+	{
+		vkp::cmd::waitTimeline(m_DeviceData, m_TimelineSemaphore, l_Frame.timelineValue);
+	}
+
+	uint32_t l_ImageIndex = 0;
+	const VkResult l_AcquireResult = m_DeviceData->vkAcquireNextImageKHR(m_DeviceData.device, m_Swapchain.swapchain, UINT64_MAX, l_Frame.imageAvailableSemaphore, VK_NULL_HANDLE, &l_ImageIndex);
+	if (l_AcquireResult == VK_ERROR_OUT_OF_DATE_KHR)
+	{
+		return;
+	}
+
+	const VkSemaphore l_RenderFinished = m_Swapchain.renderFinishedSemaphores[l_ImageIndex];
+
+	m_DeviceData->vkResetCommandPool(m_DeviceData.device, l_Frame.commandPool.handle, 0);
+
+	vkp::cmd::recordingScope(m_DeviceData, l_Frame.commandBuffer, true, [&](const VkCommandBuffer p_Cb)
+	{
+		constexpr VkClearValue l_ClearColor{ .color = { .float32 = { 0.15f, 0.15f, 0.2f, 1.0f } } };
+		constexpr VkClearValue l_ClearDepth{ .depthStencil = { .depth = 1.0f, .stencil = 0 } };
+
+		vkp::cmd::RenderingInfoBuilder l_RenderTargets{};
+		l_RenderTargets
+			.setRenderArea(m_Swapchain.properties.extent)
+			.color({
+				.imageView = m_Swapchain.imageViews[l_ImageIndex],
+				.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+				.clearValue = l_ClearColor,
+			})
+			.depth({
+				.imageView = l_Frame.depthView,
+				.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+				.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+				.clearValue = l_ClearDepth,
+			});
+
+		const VkRenderingInfo l_RenderingInfo = l_RenderTargets.build();
+
+		vkp::cmd::BasicBarrierBuilder<0, 0, 1> l_Barriers{};
+		const vkp::ImageProperties l_SwapchainImage = m_Swapchain.imageProperties();
+
 #ifndef NDEBUG
-	spdlog::debug("Recreated swapchain with new extent: {}x{} ({} images)", p_Extent.width, p_Extent.height, m_Swapchain.images.size());
+		constexpr float l_LabelColor[4]{ 1.0f, 1.0f, 1.0f, 1.0f };
+		vkp::cmd::debugScope(p_Cb, "triangle", l_LabelColor, [&](const VkCommandBuffer p_Cb)
+		{
 #endif
+			l_Barriers
+				.image(m_Swapchain.images[l_ImageIndex], l_SwapchainImage, {
+					.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,						 .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+					.srcStage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, .srcAccess = VK_ACCESS_2_NONE,
+					.dstStage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, .dstAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
+				}).record(m_DeviceData, p_Cb);
+
+			vkp::cmd::renderScope(m_DeviceData, p_Cb, l_RenderingInfo, [&](const VkCommandBuffer p_Cb)
+			{
+				m_DeviceData->vkCmdBindPipeline(p_Cb, VK_PIPELINE_BIND_POINT_GRAPHICS, m_TrianglePipeline.pipeline);
+
+				vkp::cmd::pushConstants(m_DeviceData, p_Cb, m_TrianglePipeline.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(m_ImguiTint), &m_ImguiTint);
+
+				constexpr VkDeviceSize l_Offset = 0;
+				m_DeviceData->vkCmdBindVertexBuffers(p_Cb, 0, 1, &m_TriangleVertexBuffer.buffer, &l_Offset);
+				m_DeviceData->vkCmdDraw(p_Cb, 3, 1, 0, 0);
+
+				ImDrawData* l_DrawData = ImGui::GetDrawData();
+				ImGui_ImplVulkan_RenderDrawData(l_DrawData, p_Cb);
+			});
+
+			l_Barriers.clear()
+				.image(m_Swapchain.images[l_ImageIndex], l_SwapchainImage, {
+					.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,		 .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+					.srcStage = VK_PIPELINE_STAGE_2_NONE,						 .srcAccess = VK_ACCESS_2_NONE,
+					.dstStage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, .dstAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
+				}).record(m_DeviceData, p_Cb);
+#ifndef NDEBUG
+		});
+#endif
+	});
+
+	++m_TimelineValue;
+
+	constexpr VkPipelineStageFlags2 l_WaitStage2 = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+	const VkCommandBuffer l_CommandBuffers[]{ l_Frame.commandBuffer };
+	const vkp::cmd::SemaphoreSubmit l_Waits[]{
+		{ .semaphore = l_Frame.imageAvailableSemaphore, .stageMask = l_WaitStage2, .value = 0 },
+	};
+
+	const vkp::cmd::SemaphoreSubmit l_Signals[]{
+		{ .semaphore = l_RenderFinished, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .value = 0 },
+		{ .semaphore = m_TimelineSemaphore, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .value = m_TimelineValue },
+	};
+
+	vkp::cmd::submit2<1, 1, 2>(m_DeviceData, m_GraphicsQueue, l_CommandBuffers, l_Waits, l_Signals, VK_NULL_HANDLE);
+	l_Frame.timelineValue = m_TimelineValue;
+
+	const VkPresentInfoKHR l_PresentInfo{
+		.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+		.pNext = nullptr,
+		.waitSemaphoreCount = 1,
+		.pWaitSemaphores = &l_RenderFinished,
+		.swapchainCount = 1,
+		.pSwapchains = &m_Swapchain.swapchain,
+		.pImageIndices = &l_ImageIndex,
+		.pResults = nullptr,
+	};
+	const VkResult l_PresentResult = m_DeviceData->vkQueuePresentKHR(m_GraphicsQueue, &l_PresentInfo);
+	if (l_PresentResult == VK_ERROR_OUT_OF_DATE_KHR || l_PresentResult == VK_SUBOPTIMAL_KHR)
+	{
+		m_DeviceData->vkQueueWaitIdle(m_GraphicsQueue);
+	}
+
+	m_CurrentFrame = (m_CurrentFrame + 1) % c_FramesInFlight;
+
+	m_FrameArena.reset();
+}
+
+void Engine::destroy()
+{
+
+#ifndef NDEBUG
+	spdlog::debug("Destroying engine...");
+#endif
+	m_DeviceData->vkDeviceWaitIdle(m_DeviceData.device);
+
+	ImGui_ImplVulkan_Shutdown();
+	ImGui_ImplSDL3_Shutdown();
+	ImGui::DestroyContext();
+
+	if (m_ImguiDescriptorPool)
+	{
+		m_DeviceData->vkDestroyDescriptorPool(m_DeviceData.device, m_ImguiDescriptorPool, nullptr);
+	}
+
+	vkp::destroyBuffer(m_DeviceData, m_TriangleVertexBuffer);
+
+	for (FrameResources& l_Frame : m_FrameResources)
+	{
+		vkp::destroySemaphore(m_DeviceData.device, l_Frame.imageAvailableSemaphore);
+		vkp::destroyImageView(m_DeviceData, l_Frame.depthView);
+		vkp::destroyImage(m_DeviceData, l_Frame.depthBuffer);
+		l_Frame.commandPool.destroy(m_DeviceData.device);
+	}
+
+	vkp::pipeline::destroyPipeline(m_DeviceData, m_TrianglePipeline);
+
+	m_Swapchain.destroy(m_DeviceData);
+
+	m_DeviceData->vkDestroySemaphore(m_DeviceData.device, m_TimelineSemaphore, nullptr);
+
+	vmaDestroyAllocator(m_DeviceData.allocator);
+	vkDestroyDevice(m_DeviceData.device, nullptr);
+
+	m_Window.destroy(m_Instance);
+	vkp::destroyInstance(m_Instance, m_DebugUtils);
+
+	volkFinalize();
 }

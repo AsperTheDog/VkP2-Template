@@ -18,9 +18,9 @@
 #include "vkp2/dyn/barrier.hpp"
 #include "vkp2/extra/window.hpp"
 
-constexpr bool g_AssertOnError = false;
+constexpr bool ASSERT_ON_ERROR = false;
 
-constexpr VkPipelineStageFlags2 g_DepthStages = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+constexpr VkPipelineStageFlags2 DEPTH_STAGES = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(const VkDebugUtilsMessageSeverityFlagBitsEXT p_MessageSeverity, const VkDebugUtilsMessageTypeFlagsEXT p_MessageType, const VkDebugUtilsMessengerCallbackDataEXT* p_CallbackData, void*)
 {
@@ -35,7 +35,7 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(const VkDebugUtilsMessageSev
     else if (p_MessageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
     {
         spdlog::error("validation layer ({}): \n{}", string_VkDebugUtilsMessageTypeFlagsEXT(p_MessageType), p_CallbackData->pMessage);
-		if (g_AssertOnError)
+		if (ASSERT_ON_ERROR)
     		__debugbreak();
     }
 
@@ -134,7 +134,7 @@ void Engine::init()
 	}
 
 	{
-		m_Swapchain = vkp::Swapchain(m_DeviceData, m_Window.getSurface(), c_FramesInFlight, m_Window.getSize().toVkExtent2D(), VK_PRESENT_MODE_FIFO_KHR, g_PreferredSurfaceFormats);
+		m_Swapchain = vkp::Swapchain(m_DeviceData, m_Window.getSurface(), FRAMES_IN_FLIGHT, m_Window.getSize().toVkExtent2D(), VK_PRESENT_MODE_FIFO_KHR, PREFERRED_SURFACE_FORMATS);
 		m_Window.getOnPixelResize().connect(this, &Engine::recreateSwapchain);
 
 #ifndef NDEBUG
@@ -148,7 +148,7 @@ void Engine::init()
 	}
 
 	{
-		ensureFrameSlots(c_FramesInFlight);
+		ensureFrameSlots(FRAMES_IN_FLIGHT);
 
 #ifndef NDEBUG
 		spdlog::debug("Created {} frame resources", m_FrameResources.size());
@@ -282,7 +282,7 @@ void Engine::ensureDepthResources()
 		l_Transitions.image(l_Frame.depthBuffer, {
 			.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
 			.srcStage = VK_PIPELINE_STAGE_2_NONE,	.srcAccess = VK_ACCESS_2_NONE,
-			.dstStage = g_DepthStages,				.dstAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+			.dstStage = DEPTH_STAGES,				.dstAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
 		});
 	}
 
@@ -318,7 +318,7 @@ void Engine::recreateSwapchain(const Window::Size p_Extent)
 {
 	m_DeviceData->vkQueueWaitIdle(m_GraphicsQueue);
 	m_Swapchain.recreate(m_DeviceData, m_Window.getSurface(), p_Extent.toVkExtent2D());
-	ensureFrameSlots(c_FramesInFlight);
+	ensureFrameSlots(FRAMES_IN_FLIGHT);
 	ensureDepthResources();
 #ifndef NDEBUG
 	spdlog::debug("Recreated swapchain with new extent: {}x{} ({} images)", p_Extent.width, p_Extent.height, m_Swapchain.images.size());
@@ -503,7 +503,7 @@ void Engine::drawFrame()
 		m_DeviceData->vkQueueWaitIdle(m_GraphicsQueue);
 	}
 
-	m_CurrentFrame = (m_CurrentFrame + 1) % c_FramesInFlight;
+	m_CurrentFrame = (m_CurrentFrame + 1) % FRAMES_IN_FLIGHT;
 
 	m_FrameArena.reset();
 }

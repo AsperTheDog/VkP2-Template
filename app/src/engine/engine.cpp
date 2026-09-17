@@ -35,7 +35,7 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(const VkDebugUtilsMessageSev
     else if (p_MessageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
     {
         spdlog::error("validation layer ({}): \n{}", string_VkDebugUtilsMessageTypeFlagsEXT(p_MessageType), p_CallbackData->pMessage);
-		if (ASSERT_ON_ERROR)
+		if constexpr (ASSERT_ON_ERROR)
     		__debugbreak();
     }
 
